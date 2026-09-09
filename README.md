@@ -2,6 +2,8 @@
 
 Real-time liquid water and water ray-tracing on an **infinite lake surface**, rendered with WebGPU compute shaders via [`euv`](https://crates.io/crates/euv) and [`euv-engine`](https://crates.io/crates/euv-engine).
 
+**Live demo**: https://eastspire.github.io/water-surface/  *(requires Chrome 128+ or another WebGPU-capable browser; GitHub Pages' swiftshader backend cannot render WebGPU compute and will show a black canvas)*
+
 ## Demo
 
 Wind blows over a procedurally tiled ocean. The surface lifts into Gerstner-style ripples, the sky's sun and clouds reflect across the plane (with the reflection breaking up as the wave height grows), and a Fresnel-style mix between refracted deep-water color and sky reflection gives the surface its real-world look.
