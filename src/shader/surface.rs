@@ -71,17 +71,15 @@ struct VertexOutput {
 };
 
 @vertex
-fn vs_main(@builtin(vertex_index) vidx: u32) -> VertexOutput {
+fn vs_main(
+    @location(0) position: vec2<f32>,
+    @builtin(vertex_index) vidx: u32,
+) -> VertexOutput {
     let grid_n = u32(u.grid_resolution);
     let row = vidx / grid_n;
     let col = vidx - row * grid_n;
-    // Position is procedurally generated from the grid index — no vertex
-    // buffer is bound. This avoids the dependency on `set_vertex_buffer`
-    // which is a `pub(crate)` method in euv-engine.
-    let x_local = (f32(col) / f32(grid_n - 1u)) * u.mesh_cell_size * f32(grid_n - 1u);
-    let z_local = (f32(row) / f32(grid_n - 1u)) * u.mesh_cell_size * f32(grid_n - 1u);
-    let x_world = u.mesh_origin_x + x_local;
-    let z_world = u.mesh_origin_z + z_local;
+    let x_world = u.mesh_origin_x + position.x;
+    let z_world = u.mesh_origin_z + position.y;
 
     let h = index_height(col, row) * u.height_amplitude;
     let world_pos = vec3<f32>(x_world, h, z_world);

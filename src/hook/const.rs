@@ -24,10 +24,6 @@ pub(crate) const WAVE_DAMPING: f32 = 0.012;
 /// peaks but exaggerates the height-vs-horizontal ratio.
 pub(crate) const HEIGHT_AMPLITUDE_M: f32 = 1.4;
 
-/// Vertical exaggeration for the procedural Gerstner-style component that
-/// we layer on top of the simulated height — gives the surface a baseline
-/// swell even when the user hasn't touched the lake.
-pub(crate) const GERSTNER_AMPLITUDE_M: f32 = 0.18;
 
 /// Initial camera orbit angles in radians (yaw, pitch, distance).
 pub(crate) const INITIAL_YAW_RAD: f32 = 0.6;

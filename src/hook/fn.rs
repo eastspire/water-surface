@@ -1,10 +1,11 @@
 //! All hook functions: state factory, gesture handlers, RAF loop entrypoint.
 //!
-//! The simulation runs on the CPU (JavaScript-side) so we don't need any
-//! of euv-engine's `pub(crate)` GPU primitives. Each frame we integrate
+//! The simulation runs on the CPU (JavaScript-side). Each frame we integrate
 //! the 2D wave equation in a Rust-side `Vec<f32>`, upload the result to a
-//! `r32float` texture via `queue.writeTexture`, and then call
-//! `render_frame_with_bind_group` to draw the surface.
+//! `STORAGE | COPY_DST` buffer via `write_buffer`, and then drive the render
+//! pass manually with the low-level `set_pipeline` + `set_bind_group` +
+//! `set_vertex_buffer` + `set_index_buffer` + `draw_indexed` chain (euv-engine
+//! 0.20.6+).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -16,36 +17,32 @@ use euv::web_sys::*;
 use euv::*;
 
 use euv_engine::*;
-use js_sys::{Function, Math, Object, Reflect};
+use js_sys::Math;
 
 use super::r#const::*;
 use super::r#struct::{CameraOrbit, UseWater};
 use crate::shader::surface::SURFACE_SHADER;
 
+/// WebGPU buffer-usage bitmask values (from the W3C WebGPU spec).
+///
+/// `euv-engine` keeps these as `pub(crate)` constants — water-surface needs
+/// the raw values to call `create_buffer(size, usage)`, so we redeclare the
+/// three values we actually use. See
+/// <https://www.w3.org/TR/webgpu/#buffer-usage> for the full bitmask.
+mod usage {
+    /// Buffer bound as `var<storage, read>` / `var<storage, read_write>`.
+    pub const STORAGE: u32 = 0x80;
+    /// Pipeline-uniform binding (`var<uniform>`).
+    pub const UNIFORM: u32 = 0x40;
+    /// `COPY_DST (0x08)` — required on any buffer the CPU writes to via
+    /// `queue.writeBuffer`.
+    pub const COPY_DST: u32 = 0x08;
+}
+
 /// Creates the page-level reactive state.
 pub(crate) fn use_water_state() -> UseWater {
     UseWater::default()
 }
-
-/// Wraps an arbitrary `Reflect::set` call so it can be chained.
-macro_rules! js_set {
-    ($obj:expr, $key:expr, $val:expr) => {
-        let _ = Reflect::set(&$obj, &$key, &$val);
-    };
-}
-
-/// Builds a JS dictionary object from a sequence of (key, value) pairs.
-fn js_dict<const N: usize>(entries: [(&str, JsValue); N]) -> JsValue {
-    let obj = Object::new();
-    for (k, v) in entries {
-        let _ = Reflect::set(&obj, &JsValue::from_str(k), &v);
-    }
-    obj.into()
-}
-
-/// Creates one of the three ping-pong r32float height textures used by the
-/// wave equation. Usage = TEXTURE_BINDING | COPY_DST so the CPU can write
-/// ripples into it from JS each frame and the GPU can sample it.
 
 /// Reads the canvas element's CSS layout size.
 fn read_canvas_size(selector: &str) -> Option<(f32, f32)> {
@@ -300,8 +297,8 @@ struct WaterRenderer {
     surface_bind_group: JsValue,
     vertex_buffer: JsValue,
     index_buffer: JsValue,
-    /// Number of indices in the index buffer.
-    vertex_count: u32,
+    /// Number of indices in the index buffer (one entry per triangle corner).
+    index_count: u32,
     mesh_origin: Rc<RefCell<(f32, f32)>>,
     sim: Rc<RefCell<WaveSimulation>>,
     orbit: CameraOrbit,
@@ -347,17 +344,25 @@ async fn init_water_renderer(
     state: UseWater,
     orbit: CameraOrbit,
 ) -> Result<WaterRenderer, JsValue> {
-    let config = RenderConfig::webgpu(WATER_CANVAS_SELECTOR, 1280.0, 720.0);
+    let config = RenderConfig::webgpu(WATER_CANVAS_SELECTOR, 1280.0, 800.0);
     let renderer = Engine::webgpu_renderer(&config)
         .await
         .map_err(|e| format!("webgpu_renderer init: {e:?}"))?;
 
-    // Surface (render) pipeline. The vertex shader generates positions
-    // procedurally from `vertex_index`, so we don't need any vertex
-    // buffers — the pipeline layout is empty.
+    // Surface (render) pipeline — single vertex buffer slot 0 holding
+    // `[f32; 2]` positions, no other vertex attributes.
+    let vertex_layout = VertexBufferLayout::new(
+        8u64,
+        VertexStepMode::Vertex,
+        vec![VertexAttribute::new(
+            0u32,
+            0u64,
+            "float32x2",
+        )],
+    );
     let render_pipeline = renderer.create_render_pipeline_full(
         SURFACE_SHADER,
-        &[],
+        &[vertex_layout],
         "vs_main",
         "fs_main",
         None,
@@ -366,27 +371,40 @@ async fn init_water_renderer(
         return Err(JsValue::from_str("create_render_pipeline_full returned undefined"));
     }
 
-    // Height-storage buffer — created via euv-engine so it lives on the same
-    // device the bind group / pipeline were created from. The vertex
-    // shader reads it as `var<storage, read> array<f32>`.
+    // Storage buffer for `var<storage, read> array<f32>` heights — created
+    // with `STORAGE | COPY_DST` so we can upload from CPU each frame.
     let grid_count = (GRID_RESOLUTION * GRID_RESOLUTION) as usize;
-    let height_buffer = renderer.create_uniform_buffer(&vec![0.0_f32; grid_count]);
+    let height_buffer_size = (grid_count * std::mem::size_of::<f32>()) as u64;
+    let height_buffer = renderer.create_buffer(
+        height_buffer_size,
+        usage::STORAGE | usage::COPY_DST,
+    );
     if height_buffer.is_undefined() || height_buffer.is_null() {
-        return Err(JsValue::from_str("create_uniform_buffer (heights) failed"));
+        return Err(JsValue::from_str("create_buffer (heights) failed"));
     }
 
-    // The bind group layout must list a Buffer entry for `@binding(1)`. The
-    // height-buffer entry covers binding 1 (storage/read) and the surface
-    // uniform covers binding 0.
-    let surface_uniform = renderer.create_uniform_buffer(&build_surface_uniforms(
-        &[0.0; 16],
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, -1.0),
-        0.0,
-        (0.0, 0.0),
-        0.0,
-    ));
+    // Surface-uniform buffer: mat4x4 view-proj + camera / sun / sky params.
+    let surface_uniform_size = 52 * std::mem::size_of::<f32>() as u64;
+    let surface_uniform = renderer.create_buffer(
+        surface_uniform_size,
+        usage::UNIFORM | usage::COPY_DST,
+    );
+    if surface_uniform.is_undefined() || surface_uniform.is_null() {
+        return Err(JsValue::from_str("create_buffer (uniforms) failed"));
+    }
 
+    // The bind group layout must list a Buffer entry for `@binding(0)` and
+    // `@binding(1)`. With auto-layout inferred from the pipeline, the GPU
+    // decides which slots are uniform vs storage — we just provide both
+    // buffers and the validation layer accepts it because the shader declares
+    // `var<uniform>` / `var<storage>` matching the buffer usage flags.
+    //
+    // `create_bind_group` calls `device.createBindGroup(...)` and captures
+    // any GPU validation error via `pop_error_sync`, logging it to the
+    // JS console. A mismatch between the buffer's `usage` flags and the
+    // shader's `@binding` declaration is the most common cause of a
+    // silent "no draw" (the draw call still runs, but the GPU rejects
+    // the bind group and emits zero fragments).
     let entries = vec![
         BindGroupEntry::Buffer {
             binding: 0,
@@ -406,9 +424,18 @@ async fn init_water_renderer(
         return Err(JsValue::from_str("create_bind_group (surface) failed"));
     }
 
+    // Static vertex / index buffers for the GRID_RESOLUTION × GRID_RESOLUTION
+    // mesh tile. The tile follows the camera in world space; the mesh-local
+    // coordinates span [0, MESH_TILE_SIZE_M]^2.
     let vertex_buffer = renderer.create_vertex_buffer(&build_grid_vertex_buffer());
+    if vertex_buffer.is_undefined() || vertex_buffer.is_null() {
+        return Err(JsValue::from_str("create_vertex_buffer failed"));
+    }
     let index_buffer = renderer.create_index_buffer(&build_grid_index_buffer());
-    let vertex_count = ((GRID_RESOLUTION as u32 - 1) * (GRID_RESOLUTION as u32 - 1) * 6) as u32;
+    if index_buffer.is_undefined() || index_buffer.is_null() {
+        return Err(JsValue::from_str("create_index_buffer failed"));
+    }
+    let index_count = ((GRID_RESOLUTION as u32 - 1) * (GRID_RESOLUTION as u32 - 1) * 6) as u32;
 
     state.get_ready().set(true);
 
@@ -420,7 +447,7 @@ async fn init_water_renderer(
         surface_bind_group,
         vertex_buffer,
         index_buffer,
-        vertex_count,
+        index_count,
         mesh_origin: Rc::new(RefCell::new((0.0, 0.0))),
         sim: Rc::new(RefCell::new(WaveSimulation::new())),
         orbit,
@@ -439,7 +466,7 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
 
     // Seed a few ripples for visual interest on first load.
     {
-        let mut sim_ref = renderer.borrow();
+        let sim_ref = renderer.borrow();
         let mut sim = sim_ref.sim.borrow_mut();
         sim.inject_gaussian(GRID_RESOLUTION as i32 / 2, GRID_RESOLUTION as i32 / 2, 0.6, 8);
         sim.inject_gaussian(GRID_RESOLUTION as i32 / 2 + 16, GRID_RESOLUTION as i32 / 2 - 12, 0.4, 6);
@@ -465,6 +492,18 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
         last_frame = now;
         let elapsed = (now - start_time) as f32 / 1000.0;
         frame_count += 1;
+        // Drain any GPU validation error that surfaced since the last
+        // frame. `pop_error_sync` is asynchronous (it writes the result
+        // to `pending_error` via a microtask), so the value is only
+        // visible on the next render tick.
+        if frame_count <= 5 || frame_count % 60 == 0 {
+            if let Some(err) = renderer_for_closure.borrow().renderer.take_last_error() {
+                let s = format!("{err:?}");
+                web_sys::console::error_1(&JsValue::from_str(&format!(
+                    "[water] gpu error (frame {frame_count}): {s}"
+                )));
+            }
+        }
         if frame_count % 30 == 0 {
             let fps = 1.0 / dt.max(1e-3);
             renderer_for_closure.borrow().state.get_fps().set(fps);
@@ -492,15 +531,20 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
         }
 
         // Step 3: upload the simulation buffer to the GPU height-storage
-        // buffer via euv-engine's `update_uniform_buffer`.
-        let curr_slice = {
+        // buffer via euv-engine's `write_buffer`.
+        let curr_bytes = {
             let r = renderer_for_closure.borrow();
-            r.sim.borrow().curr.clone()
+            let curr = &r.sim.borrow().curr;
+            let mut bytes = Vec::with_capacity(curr.len() * 4);
+            for &v in curr.iter() {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            bytes
         };
         {
-            let mut r = renderer_for_closure.borrow_mut();
+            let r = renderer_for_closure.borrow_mut();
             r.renderer
-                .update_uniform_buffer(&r.height_buffer, &curr_slice);
+                .write_buffer(&r.height_buffer, 0, &curr_bytes);
         }
 
         // Step 4: snap mesh origin to the camera.
@@ -526,35 +570,49 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
             WaterRenderer::cell_size(),
         );
         {
-            let r = renderer_for_closure.borrow();
+            let uniforms_bytes: Vec<u8> = uniforms
+                .iter()
+                .flat_map(|f| f.to_le_bytes())
+                .collect();
+            let r = renderer_for_closure.borrow_mut();
             r.renderer
-                .update_uniform_buffer(&r.surface_uniform, &uniforms);
+                .write_buffer(&r.surface_uniform, 0, &uniforms_bytes);
         }
 
-        // Step 6: render the surface via the high-level API.
-        let render_pipeline = {
-            renderer_for_closure.borrow().render_pipeline.clone()
+        // Step 6: drive the render pass manually with the new low-level API.
+        // `begin_render_pass` requires `&mut self`, so we hold a single
+        // `borrow_mut` scope for the whole pass + submit sequence.
+        let command_buffer = {
+            let mut r = renderer_for_closure.borrow_mut();
+            let encoder = r.renderer.create_command_encoder();
+            let pass = r
+                .renderer
+                .begin_render_pass(&encoder, (0.55, 0.72, 0.86, 1.0));
+            if frame_count == 1 {
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "[water] first render: pipeline={:?}, bind_group={:?}, vb={:?}, ib={:?}, ic={}",
+                    if r.render_pipeline.is_undefined() { "undef" } else { "ok" },
+                    if r.surface_bind_group.is_undefined() { "undef" } else { "ok" },
+                    if r.vertex_buffer.is_undefined() { "undef" } else { "ok" },
+                    if r.index_buffer.is_undefined() { "undef" } else { "ok" },
+                    r.index_count,
+                )));
+            }
+            r.renderer.set_pipeline(&pass, &r.render_pipeline);
+            r.renderer
+                .set_bind_group(&pass, 0, &r.surface_bind_group);
+            r.renderer
+                .set_vertex_buffer(&pass, 0, &r.vertex_buffer);
+            r.renderer
+                .set_index_buffer(&pass, &r.index_buffer, "uint32");
+            r.renderer.draw_indexed(&pass, r.index_count, 1);
+            r.renderer.end_render_pass(&pass);
+            r.renderer.finish_command_encoder(&encoder)
         };
-        let surface_bind_group = {
-            renderer_for_closure.borrow().surface_bind_group.clone()
-        };
-        let vertex_count = renderer_for_closure.borrow().vertex_count;
-        if frame_count == 1 {
-            web_sys::console::log_1(&JsValue::from_str(&format!(
-                "[water] first render: bg={:?}, pipeline={:?}, vertex_count={}",
-                if surface_bind_group.is_undefined() { "undef" } else { "ok" },
-                if render_pipeline.is_undefined() { "undef" } else { "ok" },
-                vertex_count,
-            )));
-        }
-        let mut renderer_mut = renderer_for_closure.borrow_mut();
-        renderer_mut.renderer.render_frame_with_bind_group(
-            &render_pipeline,
-            &surface_bind_group,
-            (0.55, 0.72, 0.86, 1.0),
-            vertex_count,
-        );
-        drop(renderer_mut);
+        renderer_for_closure
+            .borrow_mut()
+            .renderer
+            .submit(&[command_buffer]);
 
         // Step 7: schedule next frame via the stashed Function handle.
         if let Some(win) = window() {

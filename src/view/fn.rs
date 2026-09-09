@@ -3,7 +3,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use euv::wasm_bindgen::prelude::*;
 use euv::wasm_bindgen::{JsCast, JsValue};
 use euv::*;
 
@@ -241,12 +240,6 @@ fn collect_pointers(event: &DomEvent) -> Vec<(i32, f32, f32)> {
 
 fn event_target(event: &DomEvent) -> Option<JsValue> {
     js_sys::Reflect::get(event, &JsValue::from_str("target")).ok()
-}
-
-/// Helper that returns the inner String by value. Used by the html! body
-/// so the `FnMut` closure can consume it without triggering escape-of-borrow.
-fn format_error_from_rc(rc: &Rc<String>) -> String {
-    (**rc).clone()
 }
 
 fn distance_2d(a: &(i32, f32, f32), b: &(i32, f32, f32)) -> f32 {
