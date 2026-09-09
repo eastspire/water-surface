@@ -7,8 +7,6 @@ use std::rc::Rc;
 use euv::wasm_bindgen::{JsCast, JsValue};
 use euv::*;
 
-use crate::hook::{CameraOrbit, start_water_loop, use_water_state};
-
 type DomEvent = euv::web_sys::Event;
 
 /// Top-level page. Mounts a full-viewport canvas for the WebGPU water

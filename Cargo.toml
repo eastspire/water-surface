@@ -23,10 +23,10 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 euv = "*"
-js-sys = "0.3"
 euv-engine = "*"
-wasm-bindgen = "0.2"
 lombok-macros = "*"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "*"
 

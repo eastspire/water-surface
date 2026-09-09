@@ -12,8 +12,6 @@ use euv::*;
 use euv_engine::*;
 use js_sys::Math;
 
-use crate::shader::SURFACE_SHADER;
-
 /// WebGPU buffer-usage bitmask values (from the W3C WebGPU spec).
 ///
 /// `euv-engine` keeps these as `pub(crate)` constants — water-surface needs
