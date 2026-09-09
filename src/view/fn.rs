@@ -1,4 +1,5 @@
-//! View layer — the top-level page component.
+#[allow(unused_imports)]
+use super::*;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -6,7 +7,7 @@ use std::rc::Rc;
 use euv::wasm_bindgen::{JsCast, JsValue};
 use euv::*;
 
-use crate::hook::{start_water_loop, use_water_state, CameraOrbit};
+use crate::hook::{CameraOrbit, start_water_loop, use_water_state};
 
 type DomEvent = euv::web_sys::Event;
 
@@ -14,24 +15,21 @@ type DomEvent = euv::web_sys::Event;
 /// surface and wires the gesture handlers (single-finger orbit, two-finger
 /// pinch) to a shared `CameraOrbit` state.
 pub(crate) fn app() -> VirtualNode {
-    let state = use_water_state();
-    let orbit = CameraOrbit::new();
-    let loop_started = Rc::new(RefCell::new(false));
+    let state: UseWater = use_water_state();
+    let orbit: CameraOrbit = CameraOrbit::new();
+    let loop_started: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
     // Kick off the WebGPU init + RAF loop immediately. `spawn_local` returns
     // a future that the wasm executor drives; we don't block the render.
-    let state_for_init = state.clone();
-    let orbit_for_init = orbit.clone();
-    let loop_started_for_init = loop_started.clone();
+    let state_for_init: UseWater = state.clone();
+    let orbit_for_init: CameraOrbit = orbit.clone();
+    let loop_started_for_init: Rc<RefCell<bool>> = loop_started.clone();
     euv::wasm_bindgen_futures::spawn_local(async move {
         if !*loop_started_for_init.borrow() {
             *loop_started_for_init.borrow_mut() = true;
             start_water_loop(state_for_init, orbit_for_init);
         }
     });
-
-    let canvas_element_id = "water-canvas";
-    let _ = canvas_element_id;
 
     // Snapshot reactive values into plain Rust values before entering the
     // html! body. The html! body is a FnMut closure so any reactive
@@ -43,9 +41,9 @@ pub(crate) fn app() -> VirtualNode {
     // inside html! expression slots — the html! macro auto-unwraps
     // single-segment identifier paths to `.get()`, which registers the
     // signal as a subscriber of this dynamic node.
-    let ready_signal = state.get_ready();
-    let fps_signal = state.get_fps();
-    let error_message_signal = state.get_error_message();
+    let ready_signal: euv::Signal<bool> = state.get_ready();
+    let fps_signal: euv::Signal<f32> = state.get_fps();
+    let error_message_signal: euv::Signal<String> = state.get_error_message();
 
     html! {
         div {
@@ -83,7 +81,7 @@ pub(crate) fn app() -> VirtualNode {
                     { format!("{:.0}", fps_signal.get()) }
                 }
             }
-            if error_message_signal.get().is_empty() == false {
+            if !error_message_signal.get().is_empty() {
                 div {
                     class: c_water_error_box()
                     { error_message_signal.get() }
@@ -95,30 +93,28 @@ pub(crate) fn app() -> VirtualNode {
 
 // ─── Gesture state ───────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum GestureState {
-    Idle,
-    Rotating { last_x: f32, last_y: f32 },
-    Pinching { initial_distance: f32, initial_orbit_distance: f32 },
-}
-
 thread_local! {
-    static GESTURE: RefCell<GestureState> = RefCell::new(GestureState::Idle);
-    static LAST_POINTERS: RefCell<Vec<(i32, f32, f32)>> = RefCell::new(Vec::new());
+    static GESTURE: RefCell<GestureState> = const { RefCell::new(GestureState::Idle) };
 }
 
 fn make_pointer_down_handler(orbit: CameraOrbit) -> Option<Rc<dyn Fn(DomEvent)>> {
     Some(Rc::new(move |event: DomEvent| {
-        let _ = orbit.clone();
-        let pointers = collect_pointers(&event);
+        let pointers: Vec<(i32, f32, f32)> = collect_pointers(&event);
         if pointers.len() == 1 {
             let (_, x, y) = pointers[0];
-            GESTURE.with(|g| *g.borrow_mut() = GestureState::Rotating { last_x: x, last_y: y });
+            GESTURE.with(|g| {
+                *g.borrow_mut() = GestureState::Rotating {
+                    last_x: x,
+                    last_y: y,
+                }
+            });
         } else if pointers.len() >= 2 {
-            let d = distance_2d(&pointers[0], &pointers[1]);
-            GESTURE.with(|g| *g.borrow_mut() = GestureState::Pinching {
-                initial_distance: d,
-                initial_orbit_distance: orbit.distance.get(),
+            let d: f32 = distance_2d(&pointers[0], &pointers[1]);
+            GESTURE.with(|g| {
+                *g.borrow_mut() = GestureState::Pinching {
+                    initial_distance: d,
+                    initial_orbit_distance: orbit.distance.get(),
+                }
             });
         }
         event.prevent_default();
@@ -127,19 +123,22 @@ fn make_pointer_down_handler(orbit: CameraOrbit) -> Option<Rc<dyn Fn(DomEvent)>>
 
 fn make_pointer_move_handler(orbit: CameraOrbit) -> Option<Rc<dyn Fn(DomEvent)>> {
     Some(Rc::new(move |event: DomEvent| {
-        let pointers = collect_pointers(&event);
-        let state = GESTURE.with(|g| *g.borrow());
+        let pointers: Vec<(i32, f32, f32)> = collect_pointers(&event);
+        let state: GestureState = GESTURE.with(|g| *g.borrow());
         match state {
             GestureState::Rotating { last_x, last_y } => {
                 if let Some((_, x, y)) = pointers.first() {
-                    let dx = x - last_x;
-                    let dy = y - last_y;
-                    orbit.add_yaw(-dx * crate::hook::ROTATE_SENSITIVITY);
-                    orbit.add_pitch(-dy * crate::hook::ROTATE_SENSITIVITY);
-                    let nx = *x;
-                    let ny = *y;
+                    let dx: f32 = x - last_x;
+                    let dy: f32 = y - last_y;
+                    orbit.add_yaw(-dx * ROTATE_SENSITIVITY);
+                    orbit.add_pitch(-dy * ROTATE_SENSITIVITY);
+                    let nx: f32 = *x;
+                    let ny: f32 = *y;
                     GESTURE.with(|g| {
-                        *g.borrow_mut() = GestureState::Rotating { last_x: nx, last_y: ny };
+                        *g.borrow_mut() = GestureState::Rotating {
+                            last_x: nx,
+                            last_y: ny,
+                        };
                     });
                 }
             }
@@ -148,16 +147,13 @@ fn make_pointer_move_handler(orbit: CameraOrbit) -> Option<Rc<dyn Fn(DomEvent)>>
                 initial_orbit_distance,
             } => {
                 if pointers.len() >= 2 {
-                    let d = distance_2d(&pointers[0], &pointers[1]);
+                    let d: f32 = distance_2d(&pointers[0], &pointers[1]);
                     if initial_distance > 1.0 {
-                        let scale = initial_distance / d.max(1.0);
+                        let scale: f32 = initial_distance / d.max(1.0);
                         // In scale-space: scale > 1 = fingers closer = zoom out
                         // (multiplicative distance grows).
-                        let target_distance = initial_orbit_distance * scale;
-                        let clamped = target_distance.clamp(
-                            crate::hook::MIN_DISTANCE_M,
-                            crate::hook::MAX_DISTANCE_M,
-                        );
+                        let target_distance: f32 = initial_orbit_distance * scale;
+                        let clamped: f32 = target_distance.clamp(MIN_DISTANCE_M, MAX_DISTANCE_M);
                         orbit.distance.set(clamped);
                     }
                 }
@@ -177,12 +173,12 @@ fn make_pointer_up_handler() -> Option<Rc<dyn Fn(DomEvent)>> {
 fn make_wheel_handler(orbit: CameraOrbit) -> Option<Rc<dyn Fn(DomEvent)>> {
     Some(Rc::new(move |event: DomEvent| {
         // Mouse-wheel fallback for desktop users without a trackpad.
-        let delta_y = js_sys::Reflect::get(&event, &JsValue::from_str("deltaY"))
+        let delta_y: f32 = js_sys::Reflect::get(&event, &JsValue::from_str("deltaY"))
             .ok()
             .and_then(|v| v.as_f64())
             .unwrap_or(0.0) as f32;
         if delta_y.abs() > 0.0 {
-            let factor = (delta_y * crate::hook::PINCH_SENSITIVITY * 0.02).exp();
+            let factor: f32 = (delta_y * PINCH_SENSITIVITY * 0.02).exp();
             orbit.multiply_distance(factor);
         }
         event.prevent_default();
@@ -190,47 +186,46 @@ fn make_wheel_handler(orbit: CameraOrbit) -> Option<Rc<dyn Fn(DomEvent)>> {
 }
 
 fn collect_pointers(event: &DomEvent) -> Vec<(i32, f32, f32)> {
-    let _ = LAST_POINTERS;
     let mut out: Vec<(i32, f32, f32)> = Vec::new();
-    if let Some(target) = event_target(event) {
-        if let Ok(offsets) = js_sys::Reflect::get(&target, &JsValue::from_str("touches")) {
-            if let Ok(touch_list) = offsets.dyn_into::<js_sys::Object>() {
-                let length = js_sys::Reflect::get(&touch_list, &JsValue::from_str("length"))
+    if let Some(target) = event_target(event)
+        && let Ok(offsets) = js_sys::Reflect::get(&target, &JsValue::from_str("touches"))
+        && let Ok(touch_list) = offsets.dyn_into::<js_sys::Object>()
+    {
+        let length: u32 = js_sys::Reflect::get(&touch_list, &JsValue::from_str("length"))
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as u32;
+        for i in 0..length {
+            let touch: Result<JsValue, JsValue> =
+                js_sys::Reflect::get(&touch_list, &JsValue::from_f64(i as f64));
+            if let Ok(touch_js) = touch {
+                let id: i32 = js_sys::Reflect::get(&touch_js, &JsValue::from_str("identifier"))
                     .ok()
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0) as u32;
-                for i in 0..length {
-                    let touch = js_sys::Reflect::get(&touch_list, &JsValue::from_f64(i as f64));
-                    if let Ok(touch_js) = touch {
-                        let id = js_sys::Reflect::get(&touch_js, &JsValue::from_str("identifier"))
-                            .ok()
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0) as i32;
-                        let x = js_sys::Reflect::get(&touch_js, &JsValue::from_str("clientX"))
-                            .ok()
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0) as f32;
-                        let y = js_sys::Reflect::get(&touch_js, &JsValue::from_str("clientY"))
-                            .ok()
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(0.0) as f32;
-                        out.push((id, x, y));
-                    }
-                }
-                return out;
+                    .unwrap_or(0.0) as i32;
+                let x: f32 = js_sys::Reflect::get(&touch_js, &JsValue::from_str("clientX"))
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                let y: f32 = js_sys::Reflect::get(&touch_js, &JsValue::from_str("clientY"))
+                    .ok()
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32;
+                out.push((id, x, y));
             }
         }
+        return out;
     }
     // PointerEvent fallback (mouse + pointer).
-    let id = js_sys::Reflect::get(event, &JsValue::from_str("pointerId"))
+    let id: i32 = js_sys::Reflect::get(event, &JsValue::from_str("pointerId"))
         .ok()
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0) as i32;
-    let x = js_sys::Reflect::get(event, &JsValue::from_str("clientX"))
+    let x: f32 = js_sys::Reflect::get(event, &JsValue::from_str("clientX"))
         .ok()
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0) as f32;
-    let y = js_sys::Reflect::get(event, &JsValue::from_str("clientY"))
+    let y: f32 = js_sys::Reflect::get(event, &JsValue::from_str("clientY"))
         .ok()
         .and_then(|v| v.as_f64())
         .unwrap_or(0.0) as f32;
@@ -243,8 +238,8 @@ fn event_target(event: &DomEvent) -> Option<JsValue> {
 }
 
 fn distance_2d(a: &(i32, f32, f32), b: &(i32, f32, f32)) -> f32 {
-    let dx = a.1 - b.1;
-    let dy = a.2 - b.2;
+    let dx: f32 = a.1 - b.1;
+    let dy: f32 = a.2 - b.2;
     (dx * dx + dy * dy).sqrt()
 }
 

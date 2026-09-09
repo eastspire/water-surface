@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+use super::*;
+
 /// Surface shader: vertex + fragment pair that draws the infinite lake surface.
 ///
 /// The mesh is a 256×256 grid of triangles. The vertex shader reads the

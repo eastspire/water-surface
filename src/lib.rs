@@ -2,8 +2,10 @@ mod hook;
 mod shader;
 mod view;
 
-use euv::*;
-use wasm_bindgen::prelude::*;
+#[allow(unused_imports)]
+pub(crate) use {hook::*, shader::*, view::*};
+
+use {euv::*, wasm_bindgen::prelude::*};
 
 #[wasm_bindgen(start)]
 pub fn main() {

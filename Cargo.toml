@@ -14,6 +14,8 @@ exclude = [
     "Cargo.lock",
     "**/*.log",
     ".gitignore",
+    "sh",
+    ".github",
 ]
 
 [lib]
@@ -21,9 +23,27 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 euv = "*"
-euv-engine = "*"
-lombok-macros = "*"
-wasm-bindgen = "0.2"
 js-sys = "0.3"
+euv-engine = "*"
+wasm-bindgen = "0.2"
+lombok-macros = "*"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "*"
+
+[profile.dev]
+incremental = false
+opt-level = 3
+lto = true
+panic = "unwind"
+debug = false
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.release]
+incremental = false
+opt-level = 3
+lto = true
+panic = "unwind"
+debug = false
+codegen-units = 1
+strip = "debuginfo"

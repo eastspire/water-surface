@@ -1,11 +1,4 @@
-//! All hook functions: state factory, gesture handlers, RAF loop entrypoint.
-//!
-//! The simulation runs on the CPU (JavaScript-side). Each frame we integrate
-//! the 2D wave equation in a Rust-side `Vec<f32>`, upload the result to a
-//! `STORAGE | COPY_DST` buffer via `write_buffer`, and then drive the render
-//! pass manually with the low-level `set_pipeline` + `set_bind_group` +
-//! `set_vertex_buffer` + `set_index_buffer` + `draw_indexed` chain (euv-engine
-//! 0.20.6+).
+use super::*;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -19,9 +12,7 @@ use euv::*;
 use euv_engine::*;
 use js_sys::Math;
 
-use super::r#const::*;
-use super::r#struct::{CameraOrbit, UseWater};
-use crate::shader::surface::SURFACE_SHADER;
+use crate::shader::SURFACE_SHADER;
 
 /// WebGPU buffer-usage bitmask values (from the W3C WebGPU spec).
 ///
@@ -41,7 +32,11 @@ mod usage {
 
 /// Creates the page-level reactive state.
 pub(crate) fn use_water_state() -> UseWater {
-    UseWater::default()
+    UseWater {
+        fps: euv::App::use_signal(|| 0.0_f32),
+        ready: euv::App::use_signal(|| false),
+        error_message: euv::App::use_signal(String::new),
+    }
 }
 
 /// Reads the canvas element's CSS layout size.
@@ -50,12 +45,12 @@ fn read_canvas_size(selector: &str) -> Option<(f32, f32)> {
     let document_value = window_value.document()?;
     let element = document_value.query_selector(selector).ok().flatten()?;
     let canvas: web_sys::HtmlCanvasElement = element.unchecked_into();
-    let rect = canvas.get_bounding_client_rect();
+    let rect: web_sys::DomRect = canvas.get_bounding_client_rect();
     Some((rect.width() as f32, rect.height() as f32))
 }
 
 fn normalize3(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
-    let len = (x * x + y * y + z * z).sqrt();
+    let len: f32 = (x * x + y * y + z * z).sqrt();
     if len < 1e-6 {
         (0.0, 0.0, -1.0)
     } else {
@@ -64,14 +59,18 @@ fn normalize3(x: f32, y: f32, z: f32) -> (f32, f32, f32) {
 }
 
 fn look_at(eye: (f32, f32, f32), target: (f32, f32, f32), up: (f32, f32, f32)) -> [f32; 16] {
-    let f = normalize3(target.0 - eye.0, target.1 - eye.1, target.2 - eye.2);
-    let s = normalize3(
+    let f: (f32, f32, f32) = normalize3(target.0 - eye.0, target.1 - eye.1, target.2 - eye.2);
+    let s: (f32, f32, f32) = normalize3(
         f.1 * up.2 - f.2 * up.1,
         f.2 * up.0 - f.0 * up.2,
         f.0 * up.1 - f.1 * up.0,
     );
-    let u = (s.1 * f.2 - s.2 * f.1, s.2 * f.0 - s.0 * f.2, s.0 * f.1 - s.1 * f.0);
-    let mut m = [0.0_f32; 16];
+    let u: (f32, f32, f32) = (
+        s.1 * f.2 - s.2 * f.1,
+        s.2 * f.0 - s.0 * f.2,
+        s.0 * f.1 - s.1 * f.0,
+    );
+    let mut m: [f32; 16] = [0.0_f32; 16];
     m[0] = s.0;
     m[1] = u.0;
     m[2] = -f.0;
@@ -92,9 +91,9 @@ fn look_at(eye: (f32, f32, f32), target: (f32, f32, f32), up: (f32, f32, f32)) -
 }
 
 fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
-    let f = 1.0 / (fov_y * 0.5).tan();
-    let nf = 1.0 / (near - far);
-    let mut m = [0.0_f32; 16];
+    let f: f32 = 1.0 / (fov_y * 0.5).tan();
+    let nf: f32 = 1.0 / (near - far);
+    let mut m: [f32; 16] = [0.0_f32; 16];
     m[0] = f / aspect;
     m[5] = f;
     m[10] = (far + near) * nf;
@@ -104,14 +103,14 @@ fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
 }
 
 fn multiply_mat4(a: &[f32; 16], b: &[f32; 16]) -> Vec<f32> {
-    let mut out = vec![0.0_f32; 16];
-    for col in 0..4 {
-        for row in 0..4 {
-            let mut sum = 0.0_f32;
-            for k in 0..4 {
-                sum += a[k * 4 + row] * b[col * 4 + k];
+    let mut out: Vec<f32> = vec![0.0_f32; 16];
+    for col in 0..4u32 {
+        for row in 0..4u32 {
+            let mut sum: f32 = 0.0_f32;
+            for k in 0..4u32 {
+                sum += a[k as usize * 4 + row as usize] * b[col as usize * 4 + k as usize];
             }
-            out[col * 4 + row] = sum;
+            out[col as usize * 4 + row as usize] = sum;
         }
     }
     out
@@ -119,17 +118,17 @@ fn multiply_mat4(a: &[f32; 16], b: &[f32; 16]) -> Vec<f32> {
 
 /// Builds the view-projection matrix.
 fn build_view_proj(camera_pos: (f32, f32, f32), w: f32, h: f32) -> Vec<f32> {
-    let view = look_at(camera_pos, (0.0, 0.0, 0.0), (0.0, 1.0, 0.0));
-    let aspect = w / h.max(1.0);
-    let proj = perspective(std::f32::consts::FRAC_PI_4, aspect, 0.5, 1000.0);
+    let view: [f32; 16] = look_at(camera_pos, (0.0, 0.0, 0.0), (0.0, 1.0, 0.0));
+    let aspect: f32 = w / h.max(1.0);
+    let proj: [f32; 16] = perspective(std::f32::consts::FRAC_PI_4, aspect, 0.5, 1000.0);
     multiply_mat4(&proj, &view)
 }
 
 /// Returns the camera's forward unit vector (camera → origin).
 fn camera_forward(orbit: &CameraOrbit) -> (f32, f32, f32) {
-    let yaw = orbit.yaw.get();
-    let pitch = orbit.pitch.get();
-    let cy = pitch.cos();
+    let yaw: f32 = orbit.yaw.get();
+    let pitch: f32 = orbit.pitch.get();
+    let cy: f32 = pitch.cos();
     normalize3(-yaw.sin() * cy, -pitch.sin(), -yaw.cos() * cy)
 }
 
@@ -142,10 +141,8 @@ fn build_surface_uniforms(
     mesh_origin: (f32, f32),
     cell_size: f32,
 ) -> Vec<f32> {
-    let mut u = vec![0.0_f32; 52];
-    for i in 0..16 {
-        u[i] = view_proj[i];
-    }
+    let mut u: Vec<f32> = vec![0.0_f32; SURFACE_UNIFORM_F32_COUNT];
+    u[..16].copy_from_slice(view_proj);
     u[16] = camera_pos.0;
     u[17] = camera_pos.1;
     u[18] = camera_pos.2;
@@ -188,13 +185,13 @@ fn build_surface_uniforms(
 /// Vertex buffer for the GRID_RESOLUTION × GRID_RESOLUTION grid. Each vertex
 /// is a 2D position in mesh-local space ranging over [0, MESH_TILE_SIZE_M]^2.
 fn build_grid_vertex_buffer() -> Vec<u8> {
-    let n = GRID_RESOLUTION as usize;
-    let mesh_size = MESH_TILE_SIZE_M;
-    let mut data = Vec::with_capacity(n * n * 2 * 4);
+    let n: usize = GRID_RESOLUTION as usize;
+    let mesh_size: f32 = MESH_TILE_SIZE_M;
+    let mut data: Vec<u8> = Vec::with_capacity(n * n * 2 * 4);
     for row in 0..n {
         for col in 0..n {
-            let x = (col as f32 / (n - 1) as f32) * mesh_size;
-            let z = (row as f32 / (n - 1) as f32) * mesh_size;
+            let x: f32 = (col as f32 / (n - 1) as f32) * mesh_size;
+            let z: f32 = (row as f32 / (n - 1) as f32) * mesh_size;
             data.extend_from_slice(&x.to_le_bytes());
             data.extend_from_slice(&z.to_le_bytes());
         }
@@ -204,14 +201,14 @@ fn build_grid_vertex_buffer() -> Vec<u8> {
 
 /// Index buffer for the grid — 2 triangles per quad.
 fn build_grid_index_buffer() -> Vec<u8> {
-    let n = GRID_RESOLUTION as usize;
-    let mut data = Vec::with_capacity((n - 1) * (n - 1) * 6 * 4);
+    let n: usize = GRID_RESOLUTION as usize;
+    let mut data: Vec<u8> = Vec::with_capacity((n - 1) * (n - 1) * 6 * 4);
     for row in 0..(n - 1) {
         for col in 0..(n - 1) {
-            let tl = (row * n + col) as u32;
-            let tr = tl + 1;
-            let bl = tl + n as u32;
-            let br = bl + 1;
+            let tl: u32 = (row * n + col) as u32;
+            let tr: u32 = tl + 1;
+            let bl: u32 = tl + n as u32;
+            let br: u32 = bl + 1;
             data.extend_from_slice(&tl.to_le_bytes());
             data.extend_from_slice(&bl.to_le_bytes());
             data.extend_from_slice(&tr.to_le_bytes());
@@ -235,44 +232,44 @@ struct WaveSimulation {
 
 impl WaveSimulation {
     fn new() -> Self {
-        let n = (GRID_RESOLUTION * GRID_RESOLUTION) as usize;
+        let n: usize = (GRID_RESOLUTION * GRID_RESOLUTION) as usize;
         Self {
-            prev: vec![0.0; n],
-            curr: vec![0.0; n],
+            prev: vec![0.0_f32; n],
+            curr: vec![0.0_f32; n],
         }
     }
 
     fn inject_gaussian(&mut self, cx: i32, cy: i32, amplitude: f32, radius: i32) {
-        let n = GRID_RESOLUTION as i32;
+        let n: i32 = GRID_RESOLUTION as i32;
         for dy in -radius..=radius {
             for dx in -radius..=radius {
-                let x = cx + dx;
-                let y = cy + dy;
+                let x: i32 = cx + dx;
+                let y: i32 = cy + dy;
                 if x < 0 || y < 0 || x >= n || y >= n {
                     continue;
                 }
-                let r2 = (dx * dx + dy * dy) as f32;
-                let sigma2 = (radius as f32 * 0.5).powi(2);
-                let bump = amplitude * (-r2 / (2.0 * sigma2)).exp();
+                let r2: f32 = (dx * dx + dy * dy) as f32;
+                let sigma2: f32 = (radius as f32 * 0.5).powi(2);
+                let bump: f32 = amplitude * (-r2 / (2.0 * sigma2)).exp();
                 self.curr[(y * n + x) as usize] += bump;
             }
         }
     }
 
     fn step(&mut self, c_squared: f32, damping: f32) {
-        let n = GRID_RESOLUTION as usize;
-        let mut next = vec![0.0_f32; n * n];
+        let n: usize = GRID_RESOLUTION as usize;
+        let mut next: Vec<f32> = vec![0.0_f32; n * n];
         for y in 1..(n - 1) {
             for x in 1..(n - 1) {
-                let idx = y * n + x;
-                let center = self.curr[idx];
-                let hm = self.curr[idx - 1];
-                let hp = self.curr[idx + 1];
-                let hd = self.curr[idx - n];
-                let hu = self.curr[idx + n];
-                let prev = self.prev[idx];
-                let laplacian = hm + hp + hd + hu - 4.0 * center;
-                let accel = c_squared * laplacian;
+                let idx: usize = y * n + x;
+                let center: f32 = self.curr[idx];
+                let hm: f32 = self.curr[idx - 1];
+                let hp: f32 = self.curr[idx + 1];
+                let hd: f32 = self.curr[idx - n];
+                let hu: f32 = self.curr[idx + n];
+                let prev: f32 = self.prev[idx];
+                let laplacian: f32 = hm + hp + hd + hu - 4.0 * center;
+                let accel: f32 = c_squared * laplacian;
                 next[idx] = (2.0 * center - prev + accel) * (1.0 - damping);
             }
         }
@@ -354,11 +351,7 @@ async fn init_water_renderer(
     let vertex_layout = VertexBufferLayout::new(
         8u64,
         VertexStepMode::Vertex,
-        vec![VertexAttribute::new(
-            0u32,
-            0u64,
-            "float32x2",
-        )],
+        vec![VertexAttribute::new(0u32, 0u64, "float32x2")],
     );
     let render_pipeline = renderer.create_render_pipeline_full(
         SURFACE_SHADER,
@@ -368,27 +361,25 @@ async fn init_water_renderer(
         None,
     );
     if render_pipeline.is_undefined() || render_pipeline.is_null() {
-        return Err(JsValue::from_str("create_render_pipeline_full returned undefined"));
+        return Err(JsValue::from_str(
+            "create_render_pipeline_full returned undefined",
+        ));
     }
 
     // Storage buffer for `var<storage, read> array<f32>` heights — created
     // with `STORAGE | COPY_DST` so we can upload from CPU each frame.
     let grid_count = (GRID_RESOLUTION * GRID_RESOLUTION) as usize;
     let height_buffer_size = (grid_count * std::mem::size_of::<f32>()) as u64;
-    let height_buffer = renderer.create_buffer(
-        height_buffer_size,
-        usage::STORAGE | usage::COPY_DST,
-    );
+    let height_buffer =
+        renderer.create_buffer(height_buffer_size, usage::STORAGE | usage::COPY_DST);
     if height_buffer.is_undefined() || height_buffer.is_null() {
         return Err(JsValue::from_str("create_buffer (heights) failed"));
     }
 
     // Surface-uniform buffer: mat4x4 view-proj + camera / sun / sky params.
-    let surface_uniform_size = 52 * std::mem::size_of::<f32>() as u64;
-    let surface_uniform = renderer.create_buffer(
-        surface_uniform_size,
-        usage::UNIFORM | usage::COPY_DST,
-    );
+    let surface_uniform_size: u64 = (SURFACE_UNIFORM_F32_COUNT * std::mem::size_of::<f32>()) as u64;
+    let surface_uniform =
+        renderer.create_buffer(surface_uniform_size, usage::UNIFORM | usage::COPY_DST);
     if surface_uniform.is_undefined() || surface_uniform.is_null() {
         return Err(JsValue::from_str("create_buffer (uniforms) failed"));
     }
@@ -435,7 +426,7 @@ async fn init_water_renderer(
     if index_buffer.is_undefined() || index_buffer.is_null() {
         return Err(JsValue::from_str("create_index_buffer failed"));
     }
-    let index_count = ((GRID_RESOLUTION as u32 - 1) * (GRID_RESOLUTION as u32 - 1) * 6) as u32;
+    let index_count: u32 = (GRID_RESOLUTION - 1) * (GRID_RESOLUTION - 1) * 6;
 
     state.get_ready().set(true);
 
@@ -457,7 +448,6 @@ async fn init_water_renderer(
     })
 }
 
-
 async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
     let start_time = current_time_ms();
     let mut last_frame = start_time;
@@ -468,9 +458,24 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
     {
         let sim_ref = renderer.borrow();
         let mut sim = sim_ref.sim.borrow_mut();
-        sim.inject_gaussian(GRID_RESOLUTION as i32 / 2, GRID_RESOLUTION as i32 / 2, 0.6, 8);
-        sim.inject_gaussian(GRID_RESOLUTION as i32 / 2 + 16, GRID_RESOLUTION as i32 / 2 - 12, 0.4, 6);
-        sim.inject_gaussian(GRID_RESOLUTION as i32 / 2 - 20, GRID_RESOLUTION as i32 / 2 + 18, 0.5, 7);
+        sim.inject_gaussian(
+            GRID_RESOLUTION as i32 / 2,
+            GRID_RESOLUTION as i32 / 2,
+            0.6,
+            8,
+        );
+        sim.inject_gaussian(
+            GRID_RESOLUTION as i32 / 2 + 16,
+            GRID_RESOLUTION as i32 / 2 - 12,
+            0.4,
+            6,
+        );
+        sim.inject_gaussian(
+            GRID_RESOLUTION as i32 / 2 - 20,
+            GRID_RESOLUTION as i32 / 2 + 18,
+            0.5,
+            7,
+        );
     }
 
     let renderer_for_closure = renderer.clone();
@@ -496,15 +501,15 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
         // frame. `pop_error_sync` is asynchronous (it writes the result
         // to `pending_error` via a microtask), so the value is only
         // visible on the next render tick.
-        if frame_count <= 5 || frame_count % 60 == 0 {
-            if let Some(err) = renderer_for_closure.borrow().renderer.take_last_error() {
-                let s = format!("{err:?}");
-                web_sys::console::error_1(&JsValue::from_str(&format!(
-                    "[water] gpu error (frame {frame_count}): {s}"
-                )));
-            }
+        if let Some(err) = renderer_for_closure.borrow().renderer.take_last_error()
+            && (frame_count <= 5 || frame_count.is_multiple_of(60))
+        {
+            let s = format!("{err:?}");
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "[water] gpu error (frame {frame_count}): {s}"
+            )));
         }
-        if frame_count % 30 == 0 {
+        if frame_count.is_multiple_of(30) {
             let fps = 1.0 / dt.max(1e-3);
             renderer_for_closure.borrow().state.get_fps().set(fps);
         }
@@ -532,19 +537,18 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
 
         // Step 3: upload the simulation buffer to the GPU height-storage
         // buffer via euv-engine's `write_buffer`.
-        let curr_bytes = {
+        let curr_bytes: Vec<u8> = {
             let r = renderer_for_closure.borrow();
-            let curr = &r.sim.borrow().curr;
-            let mut bytes = Vec::with_capacity(curr.len() * 4);
-            for &v in curr.iter() {
+            let curr: &Vec<f32> = &r.sim.borrow().curr;
+            let mut bytes: Vec<u8> = Vec::with_capacity(curr.len() * 4);
+            for v in curr.iter() {
                 bytes.extend_from_slice(&v.to_le_bytes());
             }
             bytes
         };
         {
             let r = renderer_for_closure.borrow_mut();
-            r.renderer
-                .write_buffer(&r.height_buffer, 0, &curr_bytes);
+            r.renderer.write_buffer(&r.height_buffer, 0, &curr_bytes);
         }
 
         // Step 4: snap mesh origin to the camera.
@@ -559,9 +563,10 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
                 *r.mesh_origin.borrow(),
             )
         };
-        let canvas_size = read_canvas_size(WATER_CANVAS_SELECTOR).unwrap_or((1280.0, 720.0));
-        let view_proj = build_view_proj(cam, canvas_size.0, canvas_size.1);
-        let uniforms = build_surface_uniforms(
+        let canvas_size: (f32, f32) =
+            read_canvas_size(WATER_CANVAS_SELECTOR).unwrap_or((1280.0, 720.0));
+        let view_proj: Vec<f32> = build_view_proj(cam, canvas_size.0, canvas_size.1);
+        let uniforms: Vec<f32> = build_surface_uniforms(
             &view_proj,
             cam,
             forward,
@@ -570,10 +575,7 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
             WaterRenderer::cell_size(),
         );
         {
-            let uniforms_bytes: Vec<u8> = uniforms
-                .iter()
-                .flat_map(|f| f.to_le_bytes())
-                .collect();
+            let uniforms_bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_le_bytes()).collect();
             let r = renderer_for_closure.borrow_mut();
             r.renderer
                 .write_buffer(&r.surface_uniform, 0, &uniforms_bytes);
@@ -591,18 +593,32 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
             if frame_count == 1 {
                 web_sys::console::log_1(&JsValue::from_str(&format!(
                     "[water] first render: pipeline={:?}, bind_group={:?}, vb={:?}, ib={:?}, ic={}",
-                    if r.render_pipeline.is_undefined() { "undef" } else { "ok" },
-                    if r.surface_bind_group.is_undefined() { "undef" } else { "ok" },
-                    if r.vertex_buffer.is_undefined() { "undef" } else { "ok" },
-                    if r.index_buffer.is_undefined() { "undef" } else { "ok" },
+                    if r.render_pipeline.is_undefined() {
+                        "undef"
+                    } else {
+                        "ok"
+                    },
+                    if r.surface_bind_group.is_undefined() {
+                        "undef"
+                    } else {
+                        "ok"
+                    },
+                    if r.vertex_buffer.is_undefined() {
+                        "undef"
+                    } else {
+                        "ok"
+                    },
+                    if r.index_buffer.is_undefined() {
+                        "undef"
+                    } else {
+                        "ok"
+                    },
                     r.index_count,
                 )));
             }
             r.renderer.set_pipeline(&pass, &r.render_pipeline);
-            r.renderer
-                .set_bind_group(&pass, 0, &r.surface_bind_group);
-            r.renderer
-                .set_vertex_buffer(&pass, 0, &r.vertex_buffer);
+            r.renderer.set_bind_group(&pass, 0, &r.surface_bind_group);
+            r.renderer.set_vertex_buffer(&pass, 0, &r.vertex_buffer);
             r.renderer
                 .set_index_buffer(&pass, &r.index_buffer, "uint32");
             r.renderer.draw_indexed(&pass, r.index_count, 1);
@@ -615,13 +631,10 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
             .submit(&[command_buffer]);
 
         // Step 7: schedule next frame via the stashed Function handle.
-        if let Some(win) = window() {
-            let raf_fn = raf_fn_cell_inner
-                .borrow()
-                .as_ref()
-                .expect("raf function")
-                .clone();
-            let raf_value = win.request_animation_frame(&raf_fn);
+        if let Some(win) = window()
+            && let Some(raf_fn) = raf_fn_cell_inner.borrow().as_ref()
+        {
+            let raf_value = win.request_animation_frame(raf_fn);
             if let Ok(id) = raf_value {
                 raf_id_for_inner.set(Some(id));
             }
@@ -631,13 +644,10 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
     let raf_fn: js_sys::Function = closure.as_ref().unchecked_ref::<js_sys::Function>().clone();
     *raf_fn_cell.borrow_mut() = Some(raf_fn);
 
-    if let Some(win) = window() {
-        let raf_fn = raf_fn_cell
-            .borrow()
-            .as_ref()
-            .expect("raf function")
-            .clone();
-        let raf_value = win.request_animation_frame(&raf_fn);
+    if let Some(win) = window()
+        && let Some(raf_fn) = raf_fn_cell.borrow().as_ref()
+    {
+        let raf_value = win.request_animation_frame(raf_fn);
         if let Ok(id) = raf_value {
             raf_id_cell.set(Some(id));
         }
@@ -645,9 +655,6 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
 
     closure.forget();
 }
-
-
-
 
 fn current_time_ms() -> f64 {
     js_sys::Date::now()
