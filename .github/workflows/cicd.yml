@@ -1,0 +1,196 @@
+name: CI + CD
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: cicd
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: CI — build, lint, fmt, standards audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install euv-cli
+        run: cargo install euv-cli
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+
+      - name: cargo fmt — check
+        run: cargo fmt --all -- --check
+
+      - name: euv fmt — check
+        run: euv fmt --check
+
+      - name: cargo build (wasm32 release)
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: cargo clippy — wasm32 release, deny warnings
+        run: cargo clippy --target wasm32-unknown-unknown --release --lib --offline -- -D warnings
+        continue-on-error: false
+
+      - name: Audit rust-standards (13/13)
+        run: |
+          python3 - <<'PY'
+          import urllib.request, pathlib, sys
+          url = "https://raw.githubusercontent.com/eastspire/.agents/master/skills/rust-standards/scripts/audit_rust_standards.py"
+          dst = pathlib.Path("audit_rust_standards.py")
+          dst.write_bytes(urllib.request.urlopen(url, timeout=30).read())
+          PY
+          python3 audit_rust_standards.py .
+
+  deploy:
+    name: CD — deploy wasm bundle to GitHub Pages
+    needs: test
+    if: github.event_name == 'push' && github.ref_name == 'master'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install euv-cli
+        run: cargo install euv-cli
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+
+      - name: Build wasm release artifact
+        run: cargo build --release --target wasm32-unknown-unknown
+
+      - name: Run wasm-bindgen and emit www/index.html
+        run: |
+          wasm-bindgen target/wasm32-unknown-unknown/release/water_surface.wasm \
+            --out-dir www/pkg --target web --out-name water_surface --no-typescript
+          # `www/` is in `.gitignore` (so dev builds don't accidentally commit
+          # regenerated wasm). Re-create `www/index.html` from source on the
+          # runner — the file lives in source control under `www/index.html`
+          # but git checkout skips it because of the ignore rule.
+          mkdir -p www
+          # Re-emit the static index.html from the project layout:
+          cat > www/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8" />
+              <meta
+                name="viewport"
+                content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"
+              />
+              <title>water-surface — liquid water + ray-traced reflection</title>
+              <style>
+                html,
+                body {
+                  margin: 0;
+                  padding: 0;
+                  height: 100%;
+                  overflow: hidden;
+                  background: #000;
+                  color: #fff;
+                  font-family: system-ui, -apple-system, sans-serif;
+                  touch-action: none;
+                  overscroll-behavior: none;
+                }
+                #app {
+                  width: 100%;
+                  height: 100%;
+                }
+                #water-canvas {
+                  width: 100%;
+                  height: 100%;
+                  display: block;
+                  touch-action: none;
+                }
+                #loading {
+                  position: fixed;
+                  inset: 0;
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                  color: #fff;
+                  font-size: 14px;
+                  letter-spacing: 0.02em;
+                  background: #000;
+                  z-index: 10;
+                  pointer-events: none;
+                }
+                #hint {
+                  position: fixed;
+                  left: 50%;
+                  bottom: 24px;
+                  transform: translateX(-50%);
+                  color: rgba(255, 255, 255, 0.65);
+                  font-size: 12px;
+                  letter-spacing: 0.06em;
+                  text-transform: uppercase;
+                  z-index: 5;
+                  pointer-events: none;
+                  text-align: center;
+                  line-height: 1.6;
+                }
+              </style>
+            </head>
+            <body>
+              <div id="app">
+                <canvas id="water-canvas"></canvas>
+                <div id="loading">Initializing WebGPU…</div>
+                <div id="hint">drag to orbit · pinch to zoom</div>
+              </div>
+              <script type="module">
+                import init from "./pkg/water_surface.js";
+                init().catch((err) => {
+                  console.error("[water-surface] wasm init failed:", err);
+                  const loading = document.getElementById("loading");
+                  if (loading) {
+                    loading.textContent = "WebGPU not available in this browser.";
+                  }
+                });
+              </script>
+            </body>
+          </html>
+          HTML
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: www
+
+      - id: deployment
+        name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
