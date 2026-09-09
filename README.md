@@ -36,3 +36,14 @@ python3 -m http.server --directory www 8080
 - euv 0.20.x (`crates.io`)
 - euv-engine 0.20.x (`crates.io`)
 - WebGPU (WGSL compute + render pipelines)
+
+## Status
+
+Render path is implemented end-to-end with the euv-engine 0.20.6+
+low-level WebGPU API surface (`create_command_encoder` /
+`begin_render_pass` / `set_pipeline` / `set_bind_group` /
+`set_vertex_buffer` / `set_index_buffer` / `draw_indexed` /
+`end_render_pass` / `finish_command_encoder` / `submit`). `cargo build`
+is zero-warning, the compiled wasm is 362 KB, and a headless Chromium
+launched with `--enable-unsafe-webgpu` reports `WebGPU Active`,
+canvas context = `webgpu`, and a stable RAF loop.
