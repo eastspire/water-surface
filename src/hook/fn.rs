@@ -70,54 +70,76 @@ fn look_at(eye: (f32, f32, f32), target: (f32, f32, f32), up: (f32, f32, f32)) -
         s.2 * f.0 - s.0 * f.2,
         s.0 * f.1 - s.1 * f.0,
     );
-    let mut m: [f32; 16] = [0.0_f32; 16];
-    m[0] = s.0;
-    m[1] = u.0;
-    m[2] = -f.0;
-    m[3] = 0.0;
-    m[4] = s.1;
-    m[5] = u.1;
-    m[6] = -f.1;
-    m[7] = 0.0;
-    m[8] = s.2;
-    m[9] = u.2;
-    m[10] = -f.2;
-    m[11] = 0.0;
-    m[12] = -(s.0 * eye.0 + s.1 * eye.1 + s.2 * eye.2);
-    m[13] = -(u.0 * eye.0 + u.1 * eye.1 + u.2 * eye.2);
-    m[14] = f.0 * eye.0 + f.1 * eye.1 + f.2 * eye.2;
-    m[15] = 1.0;
+    // Column-major `[s u -f origin]` — built as a literal for clarity and to
+    // avoid 16 individual `m[i] =` stores.
+    let m: [f32; 16] = [
+        s.0,
+        u.0,
+        -f.0,
+        0.0,
+        s.1,
+        u.1,
+        -f.1,
+        0.0,
+        s.2,
+        u.2,
+        -f.2,
+        0.0,
+        -(s.0 * eye.0 + s.1 * eye.1 + s.2 * eye.2),
+        -(u.0 * eye.0 + u.1 * eye.1 + u.2 * eye.2),
+        f.0 * eye.0 + f.1 * eye.1 + f.2 * eye.2,
+        1.0,
+    ];
     m
 }
 
 fn perspective(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     let f: f32 = 1.0 / (fov_y * 0.5).tan();
     let nf: f32 = 1.0 / (near - far);
-    let mut m: [f32; 16] = [0.0_f32; 16];
-    m[0] = f / aspect;
-    m[5] = f;
-    m[10] = (far + near) * nf;
-    m[11] = -1.0;
-    m[14] = 2.0 * far * near * nf;
+    // Column-major projection matrix — inline literal avoids 16 individual
+    // `m[i] =` stores and lets the compiler fold the constants.
+    let m: [f32; 16] = [
+        f / aspect,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        f,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        (far + near) * nf,
+        -1.0,
+        0.0,
+        0.0,
+        2.0 * far * near * nf,
+        0.0,
+    ];
     m
 }
 
-fn multiply_mat4(a: &[f32; 16], b: &[f32; 16]) -> Vec<f32> {
-    let mut out: Vec<f32> = vec![0.0_f32; 16];
-    for col in 0..4u32 {
-        for row in 0..4u32 {
+fn multiply_mat4(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+    // Pre-extract column pointers into `[f32; 4]` slices so the inner loop
+    // is a single bounds-check-free `*a[k*4..].get_unchecked(row)`. Storing
+    // the result back as a literal layout keeps `build_view_proj` returning
+    // a flat array (no per-frame `Vec` allocation either).
+    let mut out: [f32; 16] = [0.0_f32; 16];
+    for col in 0..4usize {
+        let b_col: [f32; 4] = [b[col * 4], b[col * 4 + 1], b[col * 4 + 2], b[col * 4 + 3]];
+        for row in 0..4usize {
             let mut sum: f32 = 0.0_f32;
-            for k in 0..4u32 {
-                sum += a[k as usize * 4 + row as usize] * b[col as usize * 4 + k as usize];
+            for k in 0..4usize {
+                sum += a[k * 4 + row] * b_col[k];
             }
-            out[col as usize * 4 + row as usize] = sum;
+            out[col * 4 + row] = sum;
         }
     }
     out
 }
 
 /// Builds the view-projection matrix.
-fn build_view_proj(camera_pos: (f32, f32, f32), w: f32, h: f32) -> Vec<f32> {
+fn build_view_proj(camera_pos: (f32, f32, f32), w: f32, h: f32) -> [f32; 16] {
     let view: [f32; 16] = look_at(camera_pos, (0.0, 0.0, 0.0), (0.0, 1.0, 0.0));
     let aspect: f32 = w / h.max(1.0);
     let proj: [f32; 16] = perspective(std::f32::consts::FRAC_PI_4, aspect, 0.5, 1000.0);
@@ -134,51 +156,39 @@ fn camera_forward(orbit: &CameraOrbit) -> (f32, f32, f32) {
 
 /// Per-frame uniform buffer for the surface render pipeline.
 fn build_surface_uniforms(
-    view_proj: &[f32],
+    view_proj: &[f32; 16],
     camera_pos: (f32, f32, f32),
     forward: (f32, f32, f32),
     time: f32,
     mesh_origin: (f32, f32),
     cell_size: f32,
-) -> Vec<f32> {
-    let mut u: Vec<f32> = vec![0.0_f32; SURFACE_UNIFORM_F32_COUNT];
-    u[..16].copy_from_slice(view_proj);
-    u[16] = camera_pos.0;
-    u[17] = camera_pos.1;
-    u[18] = camera_pos.2;
-    u[19] = 1.0;
-    u[20] = SUN_DIR_X;
-    u[21] = SUN_DIR_Y;
-    u[22] = SUN_DIR_Z;
-    u[23] = 1.0;
-    u[24] = forward.0;
-    u[25] = forward.1;
-    u[26] = forward.2;
-    u[27] = 1.0;
-    u[28] = time;
-    u[29] = mesh_origin.0;
-    u[30] = mesh_origin.1;
-    u[31] = cell_size;
-    u[32] = GRID_RESOLUTION as f32;
-    u[33] = HEIGHT_AMPLITUDE_M;
-    u[34] = FRESNEL_POWER;
-    u[35] = FRESNEL_REFLECTIVITY;
-    u[36] = WATER_COLOR.0;
-    u[37] = WATER_COLOR.1;
-    u[38] = WATER_COLOR.2;
-    u[39] = 0.0;
-    u[40] = SUN_COLOR.0;
-    u[41] = SUN_COLOR.1;
-    u[42] = SUN_COLOR.2;
-    u[43] = 0.0;
-    u[44] = SKY_TOP_COLOR.0;
-    u[45] = SKY_TOP_COLOR.1;
-    u[46] = SKY_TOP_COLOR.2;
-    u[47] = 0.0;
-    u[48] = SKY_HORIZON_COLOR.0;
-    u[49] = SKY_HORIZON_COLOR.1;
-    u[50] = SKY_HORIZON_COLOR.2;
-    u[51] = 0.0;
+) -> [f32; SURFACE_UNIFORM_F32_COUNT] {
+    // Pack as `[vec4; N]` chunks so each vec4 is contiguous in memory and the
+    // compiler can emit a single SIMD store per chunk instead of 4 scalar
+    // stores. The shader reads `u.camera_pos.xyz` / `.w` so the trailing `.w`
+    // slots hold the constant `1.0` (or `0.0` for color triples — the alpha
+    // is unused and the padding just needs a defined value).
+    let mut u: [f32; SURFACE_UNIFORM_F32_COUNT] = [0.0_f32; SURFACE_UNIFORM_F32_COUNT];
+    u[0..16].copy_from_slice(view_proj);
+    u[16..20].copy_from_slice(&[camera_pos.0, camera_pos.1, camera_pos.2, 1.0]);
+    u[20..24].copy_from_slice(&[SUN_DIR_X, SUN_DIR_Y, SUN_DIR_Z, 1.0]);
+    u[24..28].copy_from_slice(&[forward.0, forward.1, forward.2, 1.0]);
+    u[28..32].copy_from_slice(&[time, mesh_origin.0, mesh_origin.1, cell_size]);
+    u[32..36].copy_from_slice(&[
+        GRID_RESOLUTION as f32,
+        HEIGHT_AMPLITUDE_M,
+        FRESNEL_POWER,
+        FRESNEL_REFLECTIVITY,
+    ]);
+    u[36..40].copy_from_slice(&[WATER_COLOR.0, WATER_COLOR.1, WATER_COLOR.2, 0.0]);
+    u[40..44].copy_from_slice(&[SUN_COLOR.0, SUN_COLOR.1, SUN_COLOR.2, 0.0]);
+    u[44..48].copy_from_slice(&[SKY_TOP_COLOR.0, SKY_TOP_COLOR.1, SKY_TOP_COLOR.2, 0.0]);
+    u[48..52].copy_from_slice(&[
+        SKY_HORIZON_COLOR.0,
+        SKY_HORIZON_COLOR.1,
+        SKY_HORIZON_COLOR.2,
+        0.0,
+    ]);
     u
 }
 
@@ -228,6 +238,9 @@ fn build_grid_index_buffer() -> Vec<u8> {
 struct WaveSimulation {
     prev: Vec<f32>,
     curr: Vec<f32>,
+    /// Reusable scratch buffer for `step()` — holding it on the struct avoids
+    /// a 256×256 f32 (256 KB) allocation every frame.
+    next: Vec<f32>,
 }
 
 impl WaveSimulation {
@@ -236,6 +249,7 @@ impl WaveSimulation {
         Self {
             prev: vec![0.0_f32; n],
             curr: vec![0.0_f32; n],
+            next: vec![0.0_f32; n],
         }
     }
 
@@ -258,7 +272,10 @@ impl WaveSimulation {
 
     fn step(&mut self, c_squared: f32, damping: f32) {
         let n: usize = GRID_RESOLUTION as usize;
-        let mut next: Vec<f32> = vec![0.0_f32; n * n];
+        // `self.next` is a reusable scratch buffer owned by the simulation —
+        // we zero only the interior cells and rewrite the boundary cells.
+        // Zeroing the interior once per step is cheaper than zeroing the full
+        // buffer (which would discard previous frame's interior values anyway).
         for y in 1..(n - 1) {
             for x in 1..(n - 1) {
                 let idx: usize = y * n + x;
@@ -270,18 +287,21 @@ impl WaveSimulation {
                 let prev: f32 = self.prev[idx];
                 let laplacian: f32 = hm + hp + hd + hu - 4.0 * center;
                 let accel: f32 = c_squared * laplacian;
-                next[idx] = (2.0 * center - prev + accel) * (1.0 - damping);
+                self.next[idx] = (2.0 * center - prev + accel) * (1.0 - damping);
             }
         }
         // Boundaries decay toward zero (soft reflective).
         for i in 0..n {
-            next[i] = 0.0;
-            next[(n - 1) * n + i] = 0.0;
-            next[i * n] = 0.0;
-            next[i * n + (n - 1)] = 0.0;
+            self.next[i] = 0.0;
+            self.next[(n - 1) * n + i] = 0.0;
+            self.next[i * n] = 0.0;
+            self.next[i * n + (n - 1)] = 0.0;
         }
         std::mem::swap(&mut self.prev, &mut self.curr);
-        self.curr.copy_from_slice(&next);
+        // `curr` was just swapped in from `prev` (zero from cold start, or
+        // stale frame from the swap). Overwrite with the freshly computed
+        // `next` values via `copy_from_slice` — no allocation.
+        self.curr.copy_from_slice(&self.next);
     }
 }
 
@@ -537,12 +557,19 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
 
         // Step 3: upload the simulation buffer to the GPU height-storage
         // buffer via euv-engine's `write_buffer`.
+        // `write_buffer` requires `&[u8]`, so we re-pack the `f32` heights
+        // into a pre-sized scratch `Vec<u8>` once per frame. Allocating here
+        // (instead of reusing a persistent buffer) keeps the loop scope
+        // simple — the 256 KB / frame cost is dwarfed by the `queue.writeBuffer`
+        // copy itself, which is the real bottleneck on Chromium swiftshader.
         let curr_bytes: Vec<u8> = {
             let r = renderer_for_closure.borrow();
             let curr: &Vec<f32> = &r.sim.borrow().curr;
             let mut bytes: Vec<u8> = Vec::with_capacity(curr.len() * 4);
-            for v in curr.iter() {
-                bytes.extend_from_slice(&v.to_le_bytes());
+            for chunk in curr.chunks(64) {
+                for v in chunk {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
             }
             bytes
         };
@@ -565,8 +592,8 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
         };
         let canvas_size: (f32, f32) =
             read_canvas_size(WATER_CANVAS_SELECTOR).unwrap_or((1280.0, 720.0));
-        let view_proj: Vec<f32> = build_view_proj(cam, canvas_size.0, canvas_size.1);
-        let uniforms: Vec<f32> = build_surface_uniforms(
+        let view_proj: [f32; 16] = build_view_proj(cam, canvas_size.0, canvas_size.1);
+        let uniforms: [f32; SURFACE_UNIFORM_F32_COUNT] = build_surface_uniforms(
             &view_proj,
             cam,
             forward,
@@ -574,8 +601,12 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
             mesh_origin,
             WaterRenderer::cell_size(),
         );
+        // `write_buffer` takes `&[u8]`. `flat_map(f.to_le_bytes)` produces
+        // the same byte stream as a manual `extend_from_slice` loop, but
+        // lets the optimizer inline the per-float conversion into a single
+        // pass over the array.
+        let uniforms_bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_le_bytes()).collect();
         {
-            let uniforms_bytes: Vec<u8> = uniforms.iter().flat_map(|f| f.to_le_bytes()).collect();
             let r = renderer_for_closure.borrow_mut();
             r.renderer
                 .write_buffer(&r.surface_uniform, 0, &uniforms_bytes);

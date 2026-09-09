@@ -78,13 +78,17 @@ pub(crate) fn app() -> VirtualNode {
                 }
                 span {
                     class: c_water_stats_value()
-                    { format!("{:.0}", fps_signal.get()) }
+                    {
+                        format!("{:.0}", fps_signal.get())
+                    }
                 }
             }
             if !error_message_signal.get().is_empty() {
                 div {
                     class: c_water_error_box()
-                    { error_message_signal.get() }
+                    {
+                        error_message_signal.get()
+                    }
                 }
             }
         }
