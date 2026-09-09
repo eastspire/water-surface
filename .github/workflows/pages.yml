@@ -29,6 +29,33 @@ jobs:
       - run: |
           wasm-bindgen target/wasm32-unknown-unknown/release/water_surface.wasm \
             --out-dir www/pkg --target web --out-name water_surface --no-typescript
+          # `www/` is in `.gitignore` (so dev builds don't accidentally commit
+          # regenerated wasm). Re-create `www/index.html` from source on the
+          # runner — the file lives in source control under `www/index.html`
+          # but git checkout skips it because of the ignore rule.
+          mkdir -p www
+          # Re-emit the static index.html from the project layout:
+          cat > www/index.html <<'HTML'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>water-surface · WebGPU</title>
+            <style>
+              html, body, #app { margin: 0; padding: 0; height: 100%; width: 100%; background: #000; overflow: hidden; }
+              canvas { display: block; }
+            </style>
+          </head>
+          <body>
+            <div id="app"></div>
+            <script type="module">
+              import init, { main } from './pkg/water_surface.js';
+              init().then(() => main());
+            </script>
+          </body>
+          </html>
+          HTML
       - uses: actions/upload-pages-artifact@v3
         with:
           path: www
