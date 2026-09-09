@@ -71,6 +71,10 @@ struct VertexOutput {
     @location(0) world_pos: vec3<f32>,
     @location(1) world_xz: vec2<f32>,
     @location(2) height: f32,
+    /// World-space normal computed in the vertex stage by finite-differencing
+    /// the height buffer along x and z. Passed as a varying so the fragment
+    /// stage never reads the storage buffer.
+    @location(3) world_normal: vec3<f32>,
 };
 
 @vertex
@@ -86,19 +90,33 @@ fn vs_main(
 
     let h = index_height(col, row) * u.height_amplitude;
     let world_pos = vec3<f32>(x_world, h, z_world);
+
+    // Sample 4 neighbours for the normal. Mesh-local (x, z) with bilinear
+    // filtering (clamped at the tile edges to GRID_SIZE-1) keeps the normal
+    // continuous across tile boundaries.
+    let dx = u.mesh_cell_size;
+    let local_x = position.x;
+    let local_z = position.y;
+    let n = f32(GRID_SIZE - 1u);
+    let h_l = sample_height_bilinear(local_x - dx, local_z);
+    let h_r = sample_height_bilinear(local_x + dx, local_z);
+    let h_d = sample_height_bilinear(local_x, local_z - dx);
+    let h_u = sample_height_bilinear(local_x, local_z + dx);
+    let normal = vec3<f32>(h_l - h_r, 2.0 * dx, h_d - h_u);
+
     var out: VertexOutput;
     out.clip_pos = u.view_proj * vec4<f32>(world_pos, 1.0);
     out.world_pos = world_pos;
     out.world_xz = vec2<f32>(x_world, z_world);
     out.height = h;
+    out.world_normal = normal;
     return out;
 }
 
-fn sample_height_bilinear(xz: vec2<f32>) -> f32 {
-    let local = xz - vec2<f32>(u.mesh_origin_x, u.mesh_origin_z);
+fn sample_height_bilinear(x: f32, z: f32) -> f32 {
     let n = f32(GRID_SIZE - 1u);
-    let uv_x = clamp(local.x / (n * u.mesh_cell_size), 0.0, 1.0);
-    let uv_y = clamp(local.y / (n * u.mesh_cell_size), 0.0, 1.0);
+    let uv_x = clamp(x / (n * u.mesh_cell_size), 0.0, 1.0);
+    let uv_y = clamp(z / (n * u.mesh_cell_size), 0.0, 1.0);
     let fx = uv_x * n;
     let fy = uv_y * n;
     let c0 = i32(floor(fx));
@@ -147,15 +165,6 @@ fn fbm(p: vec2<f32>) -> f32 {
     return v;
 }
 
-/// Manual normalize via `inverseSqrt` — saves the divide that the WGSL
-/// `normalize()` builtin would otherwise perform. With 5 calls per fragment
-/// over a 1280×800 surface this is roughly a 30% reduction in sqrt-class
-/// instruction count on integrated GPUs.
-fn normalize_fast(v: vec3<f32>) -> vec3<f32> {
-    let inv_len: f32 = inverseSqrt(dot(v, v));
-    return v * inv_len;
-}
-
 fn clouds(dir: vec3<f32>) -> f32 {
     let sky = dir / max(dir.y, 0.05);
     let uv = sky.xz * 0.35 + vec2<f32>(u.time * 0.02, u.time * 0.011);
@@ -173,7 +182,7 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
     let cloud_color = vec3<f32>(1.0, 0.98, 0.95);
     let base = mix(horizon, cloud_color, cloud * 0.85);
 
-    let sun = normalize_fast(u.sun_dir.xyz);
+    let sun = normalize(u.sun_dir.xyz);
     let sun_dot = dot(dir, sun);
     let disc = smoothstep(0.9995, 0.9999, sun_dot);
     let halo = pow(max(sun_dot, 0.0), 32.0) * 0.4;
@@ -185,15 +194,12 @@ fn sky_color(dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let dx = u.mesh_cell_size;
-    let h_l = sample_height_bilinear(in.world_xz + vec2<f32>(-dx, 0.0));
-    let h_r = sample_height_bilinear(in.world_xz + vec2<f32>( dx, 0.0));
-    let h_d = sample_height_bilinear(in.world_xz + vec2<f32>(0.0, -dx));
-    let h_u = sample_height_bilinear(in.world_xz + vec2<f32>(0.0,  dx));
-    let grad = vec3<f32>(h_l - h_r, 2.0 * dx, h_d - h_u);
-    let n = normalize_fast(grad);
+    // Normal is now an interpolated varying — no storage buffer access in
+    // the fragment stage. Re-normalise after interpolation to undo the
+    // perspective foreshortening artefact.
+    let n = normalize(in.world_normal);
 
-    let v = normalize_fast(u.camera_pos.xyz - in.world_pos);
+    let v = normalize(u.camera_pos.xyz - in.world_pos);
     let r = reflect(-v, n);
 
     let deep = vec3<f32>(u.water_color_r, u.water_color_g, u.water_color_b);
@@ -203,8 +209,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let fresnel = u.reflectivity + (1.0 - u.reflectivity) * pow(1.0 - max(dot(v, n), 0.0), u.fresnel_power);
     var color = mix(refracted_color, sky, fresnel);
 
-    let l = normalize_fast(u.sun_dir.xyz);
-    let h_vec = normalize_fast(l + v);
+    let l = normalize(u.sun_dir.xyz);
+    let h_vec = normalize(l + v);
     let spec = pow(max(dot(n, h_vec), 0.0), 256.0);
     let sun_color = vec3<f32>(u.sun_color_r, u.sun_color_g, u.sun_color_b);
     color += sun_color * spec * 1.5;
@@ -214,7 +220,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let dist = length(in.world_xz - u.camera_pos.xz);
     let haze = smoothstep(200.0, 800.0, dist);
-    let haze_dir = normalize_fast(vec3<f32>(0.0, 0.05, -1.0));
+    let haze_dir = normalize(vec3<f32>(0.0, 0.05, -1.0));
     color = mix(color, sky_color(haze_dir), haze * 0.7);
 
     return vec4<f32>(color, 1.0);

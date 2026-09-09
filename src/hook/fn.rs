@@ -520,7 +520,6 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
         // to `pending_error` via a microtask), so the value is only
         // visible on the next render tick.
         if let Some(err) = renderer_for_closure.borrow().renderer.take_last_error()
-            && (frame_count <= 5 || frame_count.is_multiple_of(60))
         {
             let s = format!("{err:?}");
             web_sys::console::error_1(&JsValue::from_str(&format!(
