@@ -519,8 +519,7 @@ async fn run_water_loop(renderer: Rc<RefCell<WaterRenderer>>) {
         // frame. `pop_error_sync` is asynchronous (it writes the result
         // to `pending_error` via a microtask), so the value is only
         // visible on the next render tick.
-        if let Some(err) = renderer_for_closure.borrow().renderer.take_last_error()
-        {
+        if let Some(err) = renderer_for_closure.borrow().renderer.take_last_error() {
             let s = format!("{err:?}");
             web_sys::console::error_1(&JsValue::from_str(&format!(
                 "[water] gpu error (frame {frame_count}): {s}"
